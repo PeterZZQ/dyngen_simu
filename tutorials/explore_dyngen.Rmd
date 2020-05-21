@@ -1,0 +1,481 @@
+---
+title: "Dyngen data generation pipeline"
+output: html_notebook
+---
+
+
+```{r setup, include=FALSE}
+# knitr::opts_chunk$set(fig.path = "man/figures/README_", warning=FALSE, message=FALSE, error=FALSE, echo = TRUE)
+rm(list = ls())
+gc()
+```
+
+```{r}
+library(tidyverse)
+library(rlang)
+library(dyngen)
+library(dyngen.manuscript)
+```
+A package for generating synthetic single-cell data starting from regulatory networks. The data is generated in several steps:
+
+
+## Just two steps-simplified ver.
+
+### Step 1: Initialize the model and set the parameters
+**The most important step**
+
+A dyngen simulation can be started by providing a backbone to the `initialise_model()` function.
+The backbone of a `dyngen` model is what determines the overall dynamic process 
+that a cell will undergo during a simulation. It consists of a set of gene modules, which regulate
+eachother in such a way that expression of certain genes change over time in a specific manner.
+
+```
+model <- initialise_model(backbone, num_cells, num_tfs, num_targets, num_hks, distance_matric,tf_network_params, feature_network_params, kinetics_params, gold_standard_params, simulation_params, experiment_params, verbose, download_cache_dir, num_cores, id )
+```
+
+- `backbone` the backbone to choose, we can either do it by 
+
+```{r}
+backbones <- list_backbones()
+backbones_name <- names(backbones)
+
+backb <- backbones[[backbones_name[1]]]
+# or 
+# backb <- backbones$bifurcating()
+```
+
+or do it by, there are corresponding functions, returning a list with elements named as `module_info`, `module_network` and `expression_patterns` 
+
+```{r}
+backb <- backbone_bifurcating()
+attributes(backb)
+
+```
+```{r}
+?initialise_model()
+```
+- `num_cells`, default `1000`, number of cells or samples
+- `num_tfs`, the number of transcription factors (TFs) to generate. TFs can only be controled by other TFs
+- `num_targets`, the number of target genes to generate, target genes can only be regulated by other target genes or TFs
+- `num_hks`, the number of housekeeping genes to generate, HKs are highly expressed but not regulated by TFs and targets
+- `distance_metric`, the distance matric to be used to calculate the distance between cells, note that aside from `euclidean`, we have `pearson`, `spearman` 
+```{r}
+?tf_network_default()
+```
+- 
+```
+tf_network_params = tf_network_default(min_tfs_per_modules = 1L, sample_num_regulators = function() 2, weighted_sampling = FALSE)
+```
+generate a network for tfs, basically determines the number of tfs for each module, and the number of tfs a tfs can control (function),  
+```{r}
+?kinetics_default()
+```
+- 
+```
+feature_network_params = feature_network_default(realnet = NULL, damping = 0.01, target_resampling = Inf, max_in_degree = 5)
+``` 
+generate a network for target genes that are regulated by the tfs and housekeeping genes, `max_in_degree` is maximal indegree of each target/HKs. `realnet` the name of GRN in realnets, or sampling randomly from realnet, purpose is to generate the target/HKs. `damping` parameter for realnet sampling process. Something is not usually changed 
+
+**Kinetic parameter for data generation**
+- `kinetics_params = kinetics_default(sampler_tfs(), sampler_nontfs, sampler_interactions())` configure the params for `generate_kinetics()` function.
+
+To write different kinetics settings, you need to rewrite three functions `sampler_tfs()`, `sampler_nontfs()`, `sampler_interations()`, all three functions should be wrote with the setting `function(feature_info, feature_network, cache_dir = NULL, verbose = FALSE)`
+
+```{r}
+# parameters sampled from distribution
+sampler_tfs <- function(feature_info, feature_network, cache_dir = NULL, verbose = FALSE){
+  feature_info %>% 
+    mutate(transcription_rate = transcription_rate %|%
+             runif(n(), 1, 2),
+           translation_rate = translation_rate %|%
+             runif(n(), 100, 150),
+           mrna_halflife = mrna_halflife %|%
+             runif(n(), 2.5, 5),
+           protein_halflife=protein_halflife %|%
+             runif(n(), 5, 10),
+           independence = independence %|% 1,
+           splicing_rate = splicing_rate %|% (log(2)/(10/60)))
+}
+
+# details pls check the function below
+# format(kinetics_default())
+```
+
+**example in dyngen manuscript**
+```{r}
+kinetic_params <- kinetics_default()
+kinetic_params$sampler_tfs <- function(...){
+  x <- kinetics_default()$sampler_tfs(...)
+  x$splicing_rate <- x$splicing_rate * spling_multiplier
+  # more modifications...
+  x
+}
+```
+
+`sampler_nontfs()` samples the `transcription_rate`, `translation_rate`, `mrna_halflife` and `protein_halflife` from a supplementary file of Schwannhäusser et al., 2011, doi.org/10.1038/nature10098. **splicing_rate is by default the same as in sampler_tfs()**. independence is sampled from U(0, 1).
+
+- `gold_standard_params = gold_standard_default(tau = 30/3600, census_interval = 10/60)` parameter setting for `generate_gold_standard()`
+
+`tau = 30/3600` the time step of the ODE algorithm to generate the gold standard
+
+`census_interval = 10/60` a granularity parameter of the gold standard time steps, larger or equal to `tau`
+```{r}
+?simulation_default()
+```
+
+**simulation parameters setting**
+- `simulation_params = simulation_default()` 
+```
+simulation_default(
+  # NULL then infered from backbone
+  burn_time = NULL,
+  
+  # if NULL then infered from backbone
+  total_time = NULL,
+  
+  # params for GillespieSSA2::ssa()
+  ssa_algorithm = ssa_etl(tau = 30/3600),
+  
+  # granularity parameters
+  census_interval = 1,
+  
+  # important experiment parameters
+  experiment_params = bind_rows(simulation_type_wild_type(num_simulations = 32),
+    simulation_type_knockdown(num_simulations = 0)),
+  
+  # store the number of reaction firing
+  store_reaction_firings = FALSE,
+  
+  # store the propensities value
+  store_reaction_propensities = FALSE,
+  
+  # GRN activation
+  compute_cellwise_grn = FALSE,
+  
+  # whether or not perform dimensionality reduction
+  compute_dimred = TRUE,
+  
+  # compute propensity ratio
+  compute_propensity_ratios = FALSE,
+  
+  # generate noise to the kinetics of each simulations, takes feature_info and feature_network as input, modified and returns a list
+  kinetics_noise_function = kinetics_noise_simple(mean = 1, sd = 0.005))
+```
+
+**kinetics_noise_function has two choices**, `kinetics_noise_simple(mean = 1, sd = 0.005)` or `kinetics_noise_none()`:
+
+`mean = 1` the mean level of noise, `sd` standard deviation of noise.
+```{r}
+?kinetics_noise_none()
+```
+  
+- `experiment_params = experiment_snapshot()` 
+library construction and experiment sampling process
+```{r}
+?experiment_snapshot()
+```
+
+In all
+```{r}
+set.seed(10)
+model <- 
+  initialise_model(
+    num_tfs = 12,
+    num_targets = 30,
+    num_hks = 15,
+    backbone = backbone_bifurcating(),
+    verbose = TRUE,
+    download_cache_dir = "~/.cache/dyngen",
+    num_cores = 8
+  )
+
+plot_backbone_statenet(model)
+plot_backbone_modulenet(model)
+```
+
+## Step 2, generate the model
+```
+generate_dataset(model, output_dir = NULL, make_plots = FALSE, store_dimred = model$simulation_params$compute_dimred, store_cellwise_grn = model$simulation_params$compute_cellwise_grn, store_propensity_ratios = model$simulation_params$compute_propensity_ratio)
+```
+
+Whether or not store propensity ratio, grn, dimred...
+
+
+```{r}
+generate_dataset(
+      model,
+      # store the result out directly
+      output_dir = exp$dataset_folder(id),
+      make_plots = TRUE
+    )
+gc()
+```
+
+
+**Note: more directly, store the model**
+if expand the function using `body(generate_dataset)`, then the generation is equal to 
+```{r}
+model <- model %>% generate_tf_network() %>% generate_feature_network() %>% 
+        generate_kinetics() %>% generate_gold_standard() %>% 
+        generate_cells() %>% generate_experiment()
+```
+And it also store the `model` and `dataset` and `plots`
+
+## Step 3, store the result
+
+```{r}
+pwalk(
+  design_datasets, function(id, seed, backbone_name, tr_rate_multiplier){
+    dataset <- read_rds(exp$dataset_file(id))
+    spliced <- as.matrix(dataset$expression)
+    unspliced <- as.matrix(dataset$expression_unspliced)
+    protein <- as.matrix(dataset$expression_protein)
+    cell_info <- dataset$cell_info
+    write.csv(spliced,file = paste0("./velo_benchmark/",id,"_spliced.csv"))
+    write.csv(unspliced,file = paste0("./velo_benchmark/",id,"_unspliced.csv"))
+    write.csv(protein,file = paste0("./velo_benchmark/",id,"_unspliced.csv"))
+    write.csv(cell_info,file = paste0("./velo_benchmark/",id,"_cell_info.csv"))
+  }
+  
+)
+```
+
+
+## Results
+Usually stored as `dataset` and `model`. And the `dataset` is generated from `model`
+```{r}
+dataset <- wrap_dataset(model, store_dimred = store_dimred, 
+        store_cellwise_grn = store_cellwise_grn, store_propensity_ratios = store_propensity_ratios)
+```
+
+And `wrap_dataset` **DO LOG TRANSFORM**, main part of the function body
+```{r}
+dataset <- wrap_expression(id = model$id, counts = model$experiment$counts_mrna, 
+        expression = as(log2(model$experiment$counts_mrna + 1), 
+            "dgCMatrix"), expression_unspliced = as(log2(model$experiment$counts_premrna + 
+            1), "dgCMatrix"), expression_protein = as(log2(model$experiment$counts_protein + 
+            1), "dgCMatrix"), cell_info = model$experiment$cell_info %>% 
+            select(-from, -to, -time), feature_info = model$experiment$feature_info) %>% 
+        add_trajectory(milestone_network = model$gold_standard$network, 
+            progressions = model$experiment$cell_info %>% select(cell_id, 
+                from, to, percentage = time))
+```
+
+**The components of model**
+```
+ [1] "backbone"               "numbers"                "distance_metric"       
+ [4] "tf_network_params"      "feature_network_params" "kinetics_params"       
+ [7] "gold_standard_params"   "simulation_params"      "experiment_params"     
+[10] "verbose"                "download_cache_dir"     "num_cores"             
+[13] "id"                     "feature_info"           "feature_network"       
+[16] "simulation_system"      "gold_standard"          "simulations"           
+[19] "experiment"    
+```
+And `model$experiment` mainly stored the raw count and cell info
+```
+[1] "counts_premrna"    "counts_mrna"       "counts_protein"    "feature_info"     
+[5] "cell_info"         "cellwise_grn"      "propensity_ratios"
+```
+
+And `model$simulations` mainly stored the propensity results
+```
+[1] "meta"                  "counts"                "cellwise_grn"         
+[4] "reaction_firings"      "reaction_propensities" "propensity_ratios"    
+[7] "kd_multiplier"         "perturbed_parameters"  "dimred"               
+[10] "dimred_projected" 
+```
+
+## Generation step explained
+`generate_kinetics()` the body part is explained as below
+```{r}
+{
+    if (model$verbose) 
+        cat("Precompiling reactions for simulations\n")
+    reactions <- .generate_cells_precompile_reactions(model)
+    if (model$verbose) 
+        cat("Running ", nrow(model$simulation_params$experiment_params), 
+            " simulations\n", sep = "")
+    simulations <- pbapply::pblapply(X = seq_len(nrow(model$simulation_params$experiment_params)), 
+        cl = model$num_cores, FUN = .generate_cells_simulate_cell, 
+        model = model, reactions = reactions)
+    
+    # true count is obtained from here
+    model$simulations <- lst(meta = map_df(simulations, "meta"), 
+        counts = do.call(rbind, map(simulations, "counts")), 
+        cellwise_grn = do.call(rbind, map(simulations, "cellwise_grn")), 
+        reaction_firings = do.call(rbind, map(simulations, "reaction_firings")), 
+        reaction_propensities = do.call(rbind, map(simulations, 
+            "reaction_propensities")), propensity_ratios = do.call(rbind, 
+            map(simulations, "propensity_ratios")), kd_multiplier = do.call(rbind, 
+            map(simulations, "kd_multiplier")), perturbed_parameters = do.call(rbind, 
+            map(simulations, "perturbed_parameters")))
+    if (model$verbose) 
+        cat("Mapping simulations to gold standard\n", sep = "")
+    if (!is.null(model[["gold_standard"]])) {
+        model$simulations$meta <- .generate_cells_predict_state(model)
+    }
+    else {
+        model$simulations$meta <- model$simulations$meta %>% 
+            rename(sim_time = time)
+    }
+    if (model$simulation_params$compute_dimred) {
+        if (model$verbose) 
+            cat("Performing dimred\n", sep = "")
+        model <- model %>% calculate_dimred()
+    }
+    model
+}
+```
+`generate_cells()` the body part is explained as below, mainly change `model$simulations`
+```{r}
+{
+    if (model$verbose) 
+        cat("Precompiling reactions for simulations\n")
+    reactions <- .generate_cells_precompile_reactions(model)
+    if (model$verbose) 
+        cat("Running ", nrow(model$simulation_params$experiment_params), 
+            " simulations\n", sep = "")
+            
+    # main simulation process
+    simulations <- pbapply::pblapply(X = seq_len(nrow(model$simulation_params$experiment_params)), 
+        cl = model$num_cores, FUN = .generate_cells_simulate_cell, 
+        model = model, reactions = reactions)
+    
+    # true results stored into model simulations, prior to expriment sampling process
+    # lst(...), similar to base::list() but for tibble, for details: https://tibble.tidyverse.org/reference/lst.html
+    model$simulations <- lst(meta = map_df(simulations, "meta"), 
+    
+        # map extract count(col) element from simulations, rbind bind them together as count
+        counts = do.call(rbind, map(simulations, "counts")), 
+        cellwise_grn = do.call(rbind, map(simulations, "cellwise_grn")), 
+        reaction_firings = do.call(rbind, map(simulations, "reaction_firings")), 
+        
+        # reaction propensities is NULL, weird
+        reaction_propensities = do.call(rbind, map(simulations, 
+            "reaction_propensities")), propensity_ratios = do.call(rbind, 
+            map(simulations, "propensity_ratios")), kd_multiplier = do.call(rbind, 
+            map(simulations, "kd_multiplier")), perturbed_parameters = do.call(rbind, 
+            map(simulations, "perturbed_parameters")))
+            
+    if (model$verbose) 
+        cat("Mapping simulations to gold standard\n", sep = "")
+    if (!is.null(model[["gold_standard"]])) {
+    
+        # state prediction, here must for trajectories inference, we only have one true order.
+        model$simulations$meta <- .generate_cells_predict_state(model)
+    }
+    
+    # if gold standard doesn't exist, then change sim_time in meta to time and use it,
+    # here meta must store "true time"
+    else {
+        model$simulations$meta <- model$simulations$meta %>% 
+            rename(sim_time = time)
+    }
+    if (model$simulation_params$compute_dimred) {
+        if (model$verbose) 
+            cat("Performing dimred\n", sep = "")
+        model <- model %>% calculate_dimred()
+    }
+    model
+}
+```
+
+`generate_experiment()` the body part is explained as below
+
+**Note that the true count is stored in `tsim_counts<-model$simulations$counts`**
+```{r}
+{
+    if (model$verbose) 
+        cat("Simulating experiment\n")
+    step_ixs <- .generate_experiment_sample_cells(model)
+    
+    # drop = FALSE, good habbit when indexing the data.frame
+    cell_info <- model$simulations$meta[step_ixs, , drop = FALSE] %>% 
+        mutate(step_ix = step_ixs)
+    if ("group" %in% names(attributes(step_ixs))) {
+        cell_info$cell_group <- attr(step_ixs, "group")
+    }
+    else {
+        cell_info <- cell_info %>% sample_n(n())
+    }
+    cell_info <- cell_info %>% mutate(cell_id = paste0("cell", 
+        row_number())) %>% select(cell_id, step_ix, simulation_i, 
+        sim_time, from, to, time, everything())
+    step_ixs <- cell_info$step_ix
+    
+    # this is the true count
+    tsim_counts <- model$simulations$counts[step_ixs, , drop = FALSE]
+    
+    # generate_experiment_fetch_realcount download real counts from website
+    # used to guide the sampling process
+    realcount <- .generate_experiment_fetch_realcount(model)
+    
+    # sampling process
+    count_simulation <- .simulate_counts_from_realcounts(tsim_counts, 
+        realcount, cell_info, sample_capture_rate = model$experiment_params$sample_capture_rate)
+        
+    # sampling result   
+    sim_counts <- count_simulation$sim_counts
+    cell_info <- count_simulation$cell_info
+    mol_info <- count_simulation$mol_info
+    
+    # store the result, count w: pre_mrna, x: mrna, y:protein
+    sim_wcounts <- sim_counts[, model$feature_info$mol_premrna, 
+        drop = FALSE]
+    sim_xcounts <- sim_counts[, model$feature_info$mol_mrna, 
+        drop = FALSE]
+    sim_ycounts <- sim_counts[, model$feature_info$mol_protein, 
+        drop = FALSE]
+    dimnames(sim_wcounts) <- dimnames(sim_xcounts) <- dimnames(sim_ycounts) <- list(cell_info$cell_id, 
+        model$feature_info$feature_id)
+    if (model$simulation_params$compute_cellwise_grn) {
+        sim_cellwise_grn <- model$simulations$cellwise_grn[step_ixs, 
+            , drop = FALSE]
+        rownames(sim_cellwise_grn) <- cell_info$cell_id
+    }
+    else {
+        sim_cellwise_grn <- NULL
+    }
+    
+    # store propensity ratio or not
+    if (model$simulation_params$compute_propensity_ratios) {
+        sim_propensity_ratios <- model$simulations$propensity_ratios[step_ixs, 
+            , drop = FALSE]
+        rownames(sim_propensity_ratios) <- cell_info$cell_id
+    }
+    else {
+        sim_propensity_ratios <- NULL
+    }
+    
+    # Store the results, should extract real count(sampled in experiment) from model$experiment 
+    model$experiment <- list(counts_premrna = sim_wcounts, counts_mrna = sim_xcounts, 
+        counts_protein = sim_ycounts, feature_info = model$feature_info, 
+        cell_info = cell_info, cellwise_grn = sim_cellwise_grn, 
+        propensity_ratios = sim_propensity_ratios)
+    model
+}
+```
+
+## Extract true count before library construction
+When dyngen draw reaction process, it use true count rather than sampled version
+
+```{r}
+# model is a list 
+model <- read_rds("temporary_files/usecase_rna_velocity_b2b/datasets/bifurcating_1_1_1/model.rds")
+print(names(model))
+print(names(model$simulations))
+```
+
+
+
+```{r}
+
+# model$feature_info$mol_premrna is a character vector store the feature(genes) name with premrna
+# other are similar
+# true_count is a matrix with colnames as gene names above
+step_ixs <- cell_info$step_ix
+true_counts <- model$simulations$counts[step_ixs, , drop = FALSE]
+unspliced_t <- true_counts[, model$feature_info$mol_premrna, drop = FALSE]
+spliced_t <- true_counts[, model$feature_info$mol_mrna, drop = FALSE]
+protein_t <- true_counts[, model$feature_info$mol_protein, drop = FALSE]
+```

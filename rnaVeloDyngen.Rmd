@@ -1,0 +1,232 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+# learn from dyngen_manuscript
+## RNA velocity model reconstruction
+```{r}
+rm(list = ls())
+gc()
+# setwd("~/Desktop/Dyngene/velo_benchmark")
+```
+## load pkgs
+```{r}
+library(tidyverse)
+library(rlang)
+library(dyngen)
+library(dyngen.manuscript)
+```
+
+## generate dataset
+```{r}
+# helper function for location of file storing, give the location, then store it in the location
+# include exp$temporary, exp$result, exp$dataset_folder, exp$model_file, exp$dataset_file, exp$velocity_file
+# interface, function("path")
+exp <- start_analysis("usecase_rna_velocity_b2b")
+names(list_backbones())
+```
+
+
+```{r}
+# store the configuration file in the current working directory, file_name % cache% data
+# design_datasets, dataframe store the configuration
+design_datasets <- exp$result("design_datasets.rds") %cache% {
+  crossing(
+    seed = 1,
+    # too long time, run script on pace
+    # seed = 1:3,
+    # backbone_name = names(list_backbones()),
+    
+    # only take out bifurcation
+    backbone_name = names(list_backbones())[[1]],
+    tr_rate_multiplier = c(1, 5, 25)
+  ) %>%
+    mutate(id = paste0(backbone_name, "_", seed, "_", tr_rate_multiplier))
+}
+design_datasets
+```
+
+
+```{r}
+# run function for every row
+pwalk(design_datasets, function(id, seed, backbone_name, tr_rate_multiplier) {
+  if (!file.exists(exp$dataset_file(id))) {
+
+    cat("## Generating ", id, "\n", sep = "")
+    set.seed(seed)
+
+    kinetic_params <- kinetics_default()
+    kinetic_params$sampler_tfs <- function(...) {
+      x <- kinetics_default()$sampler_tfs(...)
+      # the proportion
+      x$transcription_rate <- x$transcription_rate * tr_rate_multiplier
+      x
+    }
+
+    backbone <- dyngen::list_backbones()[[backbone_name]]()
+    model <-
+      initialise_model(
+        id = id,
+        # including more tfs and targets seems to make the bifurcation even clear,
+        # original setting cannot find branching point with naked eyes
+        num_tfs = nrow(backbone$module_info)*2,
+        num_targets = 70*2,
+        num_hks = 0,
+        backbone = backbone,
+        num_cells = 2000,
+        kinetics_params = kinetic_params,
+        simulation_params = simulation_default(
+          # census_interval create samples cluster, default is 1, using default for continuous differentiation
+          # census_interval = 10,
+          
+          # Currently no compute_rna_velocity for current model
+          # compute_rna_velocity = TRUE,
+          store_reaction_propensities = TRUE,
+  
+          experiment_params = bind_rows(simulation_type_wild_type(num_simulations = 5),
+            simulation_type_knockdown(num_simulations = 0)),
+           ),
+        num_cores = 8,
+        download_cache_dir = "~/.cache/dyngen",
+        verbose = TRUE
+      )
+    
+    generate_dataset(
+      model,
+      # store the result out directly
+      output_dir = exp$dataset_folder(id),
+      make_plots = TRUE
+    )
+
+    gc()
+  }
+})
+```
+# extract unspliced and spliced count
+The true rna velocity part is still underconstruction, extract unspliced and spliced count for testing purpose.
+```{r}
+
+
+pwalk(
+  design_datasets, function(id, seed, backbone_name, tr_rate_multiplier){
+    dataset <- read_rds(exp$dataset_file(id))
+    model <- read_rds(exp$model_file(id))
+    
+    spliced_log <- as.matrix(dataset$expression)
+    unspliced_log <- as.matrix(dataset$expression_unspliced)
+    protein_log <- as.matrix(dataset$expression_protein)
+    cell_info <- dataset$cell_info
+    
+    spliced <- as.matrix(model$experiment$counts_mrna)
+    unspliced <- as.matrix(model$experiment$counts_premrna)
+    protein <- as.matrix(model$experiment$counts_protein)
+    
+    write.csv(spliced,file = paste0("./simuData/",id,"_spliced.csv"))
+    write.csv(unspliced,file = paste0("./simuData/",id,"_unspliced.csv"))
+    write.csv(protein,file = paste0("./simuData/",id,"_protein.csv"))
+    write.csv(cell_info,file = paste0("./simuData/",id,"_cell_info.csv"))
+    
+    write.csv(spliced_log,file = paste0("./simuData/",id,"_spliced_l.csv"))
+    write.csv(unspliced_log,file = paste0("./simuData/",id,"_unspliced_l.csv"))
+    write.csv(protein_log,file = paste0("./simuData/",id,"_protein_l.csv"))
+    # write.csv(cell_info,file = paste0("./simuData/",id,"_cell_info.csv"))
+  }
+  
+)
+
+```
+
+
+```{r}
+attributes(exp)
+exp$velocity_file()
+```
+
+## store ground truth velocity vector
+With problem, store ground truth velocity data
+
+```
+pwalk(design_datasets, function(id, seed, backbone_name, tr_rate_multiplier) {
+  cat(id, "\n", sep = "")
+  model <- read_rds(exp$model_file(id))
+  dataset <- read_rds(exp$dataset_file(id))
+
+  reac_prop <- model$simulations$reaction_propensities
+  transcription_prop <- reac_prop[, paste0("transcription_", dataset$feature_ids)]
+  degradation_prop <- reac_prop[, paste0("premrna_degradation_", dataset$feature_ids)] + reac_prop[, paste0("mrna_degradation_", dataset$feature_ids)]
+  colnames(transcription_prop) <- colnames(degradation_prop) <- dataset$feature_ids
+  groundtruth_velocity <- as(log2(transcription_prop + 1) - log2(degradation_prop + 1), "dgCMatrix")
+
+  model$simulations$velocity_vector <- groundtruth_velocity
+
+  groundtruth_velocity_exp <- groundtruth_velocity[model$experiment$cell_info$step_ix, ]
+  rownames(groundtruth_velocity_exp) <- model$experiment$cell_info$cell_id
+  model$experiment$velocity_vector <- groundtruth_velocity_exp
+
+  dataset$velocity_vector <- groundtruth_velocity_exp
+
+  write_rds(dataset, exp$dataset_file(id), compress = "gz")
+  write_rds(model, exp$model_file(id), compress = "gz")
+})
+```
+
+
+```
+# file.remove(design_velocity <- exp$result("design_velocity.rds"))
+design_velocity <- exp$result("design_velocity.rds") %cache% {
+  tribble(
+    ~method_id, ~params, ~params_id,
+    "velocyto", list(assumption = "constant_velocity"), "constant_velocity",
+    "velocyto", list(assumption = "constant_unspliced"), "constant_unspliced",
+    "scvelo", list(mode = "deterministic"), "deterministic",
+    "scvelo", list(mode = "dynamical", var_names = "all"), "dynamical",
+    "scvelo", list(mode = "dynamical_residuals", var_names = "all"), "dynamical_residuals",
+    "scvelo", list(mode = "stochastic"), "stochastic",
+  ) %>%
+    crossing(
+      read_rds(exp$result("design_datasets.rds")) %>% select(dataset_id = id)
+    )
+}
+
+design_velocity
+```
+
+
+
+```{r}
+pwalk(
+  # add one rn row
+  design_velocity %>% mutate(rn = row_number()),
+  function(dataset_id, method_id, params, params_id, rn) {
+    cat(rn, "/", nrow(design_velocity), "\n", sep = "")
+    dataset <- read_rds(exp$dataset_file(dataset_id))
+
+    try({
+      exp$velocity_file(dataset_id, method_id, params_id) %cache% {
+        params$spliced <- dataset$expression
+        params$unspliced <- dataset$expression_unspliced
+
+        velocity_fun <-
+          if (method_id == "scvelo") {
+            scvelo::get_velocity
+          } else if (method_id == "velocyto") {
+            rnav_run_velocyto
+          }
+
+        velocity <- do.call(velocity_fun, params)
+
+        pkl <- exp$temporary("velocity/", dataset_id, "-", method_id, "-", params_id, "/scvelo.pkl")
+        if (method_id == "scvelo") {
+          reticulate::py_save_object(velocity$scvelo, filename = pkl)
+        }
+
+        velocity
+      }
+    })
+  }
+)
+
+```
+
+
+
